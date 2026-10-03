@@ -91,6 +91,16 @@ class Api:
         add("POST", "/api/dwell", self._dwell)
         add("POST", "/api/route", self._route)
         add("POST", "/api/reset-state", self._reset_state)
+        add("GET", "/api/rules", lambda params, body: self._platform.rules_status())
+        add("POST", "/api/rules/draft", self._rules_draft)
+        add("POST", "/api/rules/publish", self._rules_publish)
+        add("POST", "/api/rules/activate", self._rules_activate)
+        add("POST", "/api/rules/cancel", self._rules_cancel)
+        add("POST", "/api/rules/rollback", self._rules_rollback)
+        add("POST", "/api/rules/preview", self._rules_preview)
+        add("POST", "/api/rules/replay", self._rules_replay)
+        add("POST", "/api/rules/validate", self._rules_validate)
+        add("POST", "/api/rules/replay-at", self._rules_replay_at)
 
     def routes(self) -> list[dict]:
         """返回接口清单，供自检与文档核对。"""
@@ -264,3 +274,56 @@ class Api:
 
     def _reset_state(self, params: dict, body: dict) -> dict:
         return {"removed": self._platform.reset_state()}
+
+    # ---- 联锁规则 -------------------------------------------------------
+
+    def _rules_draft(self, params: dict, body: dict) -> dict:
+        content = body.get("content")
+        if not isinstance(content, dict):
+            raise RailError("规则内容必须是对象", component="console")
+        return self._platform.save_rule_draft(content, draft_id=str(body.get("draft_id", "")) or None)
+
+    def _rules_publish(self, params: dict, body: dict) -> dict:
+        return self._platform.publish_rules(
+            _require(body, "draft_id"),
+            _as_int(body, "expected_base", 0),
+            gate=str(body.get("gate", "deferred")),
+            reason=str(body.get("reason", "")),
+            op_id=str(body.get("op_id", "")) or None,
+        )
+
+    def _rules_activate(self, params: dict, body: dict) -> dict:
+        return self._platform.force_activate_rules(_require(body, "reason"))
+
+    def _rules_cancel(self, params: dict, body: dict) -> dict:
+        return self._platform.cancel_rules_activation(str(body.get("reason", "")))
+
+    def _rules_rollback(self, params: dict, body: dict) -> dict:
+        return self._platform.rollback_rules(
+            _as_int(body, "to_version", 0), _require(body, "reason")
+        )
+
+    def _rules_preview(self, params: dict, body: dict) -> dict:
+        content = body.get("content")
+        if not isinstance(content, dict):
+            raise RailError("规则内容必须是对象", component="console")
+        params_payload = body.get("params")
+        return self._platform.preview_rules(
+            content,
+            _require(body, "command"),
+            params_payload if isinstance(params_payload, dict) else {},
+        )
+
+    def _rules_replay(self, params: dict, body: dict) -> dict:
+        return self._platform.replay_rule_decision(_require(body, "audit_id"))
+
+    def _rules_validate(self, params: dict, body: dict) -> dict:
+        return self._platform.validate_rule_draft(_require(body, "draft_id"))
+
+    def _rules_replay_at(self, params: dict, body: dict) -> dict:
+        params_payload = body.get("params")
+        return self._platform.replay_rules_as_of(
+            _as_float(body, "at", 0.0),
+            _require(body, "command"),
+            params_payload if isinstance(params_payload, dict) else {},
+        )

@@ -88,6 +88,16 @@ class InterlockSection:
 
 
 @dataclass(frozen=True)
+class RulesSection:
+    """联锁规则策略：默认全部收在安全侧。"""
+
+    enabled: bool = True
+    allow_immediate: bool = False
+    allow_forced: bool = True
+    unmatched_default: str = "deny"
+
+
+@dataclass(frozen=True)
 class QuotaSection:
     """运行配额。"""
 
@@ -122,6 +132,7 @@ class PlatformConfig:
     gap: GapSection = field(default_factory=GapSection)
     signal: SignalSection = field(default_factory=SignalSection)
     interlock: InterlockSection = field(default_factory=InterlockSection)
+    rules: RulesSection = field(default_factory=RulesSection)
     quota: QuotaSection = field(default_factory=QuotaSection)
     audit: AuditSection = field(default_factory=AuditSection)
     console: ConsoleSection = field(default_factory=ConsoleSection)
@@ -165,6 +176,8 @@ class PlatformConfig:
             raise ConfigError("序号模数固定为 65536", component="config")
         if not 0 < self.interlock.max_locked_ratio <= 1:
             raise ConfigError("锁定比例上限必须落在 (0, 1]", component="config")
+        if self.rules.unmatched_default not in ("deny", "legacy"):
+            raise ConfigError("规则未命中策略必须是 deny 或 legacy", component="config")
         if self.quota.arrival_limit <= 0 or self.quota.depart_limit <= 0:
             raise ConfigError("运行配额必须为正", component="config")
         if self.audit.journal_segment <= 0:
@@ -211,6 +224,7 @@ def config_to_mapping(config: PlatformConfig) -> dict:
         "gap": dict(config.gap.__dict__),
         "signal": dict(config.signal.__dict__),
         "interlock": dict(config.interlock.__dict__),
+        "rules": dict(config.rules.__dict__),
         "quota": dict(config.quota.__dict__),
         "audit": dict(config.audit.__dict__),
         "console": dict(config.console.__dict__),
@@ -231,6 +245,7 @@ def config_from_mapping(payload: dict) -> PlatformConfig:
         gap=_section(GapSection, payload.get("gap")),
         signal=_section(SignalSection, payload.get("signal")),
         interlock=_section(InterlockSection, payload.get("interlock")),
+        rules=_section(RulesSection, payload.get("rules")),
         quota=_section(QuotaSection, payload.get("quota")),
         audit=_section(AuditSection, payload.get("audit")),
         console=_section(ConsoleSection, payload.get("console")),

@@ -20,16 +20,18 @@ from .door import (
     close_and_audit,
     depart,
     depart_policy,
+    departed,
     door_report,
     door_state,
     enqueue,
     open_pressure,
     open_doors,
     open_group,
+    opened,
     process_queue,
     queued_total,
 )
-from .errors import RailError
+from .errors import InterlockError, RailError
 from .eventbus import Event, EventBus
 from .gap import GapRegistry, gap_summary
 from .ids import IdFactory
@@ -46,6 +48,15 @@ from .ns import Namespace, NamespaceRegistry
 from .platform import MappingRegistry, adjacent, group_keys, physical_groups, resolve
 from .psd import LockoutRegistry, PSD, PSDRegistry, sweep_station
 from .quota import QuotaRegistry
+from .rules import (
+    GatePolicy,
+    Quiescence,
+    RulePolicy,
+    RuleService,
+    RuleStore,
+    default_catalog,
+    repair_journal_tail,
+)
 from .sig import SignalController, aspect_of, depart_checked, refresh_position, signal_summary
 from .station import (
     DoorZone,
@@ -133,6 +144,23 @@ class Platform:
             store, self.align, self.commands, self.gates, self.lockouts
         )
         self.doors.set_batch_limit(self.config.door.batch_limit)
+
+        rules_repair = repair_journal_tail(store.root)
+        if rules_repair["truncated_bytes"]:
+            self.audit.record("rules_journal_repaired", "", "", **rules_repair)
+        self.rules = RuleService(
+            RuleStore(JsonlJournal(store.root, "rules", segment_limit=self.config.audit.journal_segment)),
+            default_catalog(),
+            self.audit,
+            self.bus,
+            self.clock,
+            IdFactory("rules"),
+            policy=RulePolicy(
+                allow_immediate=self.config.rules.allow_immediate,
+                allow_forced=self.config.rules.allow_forced,
+                unmatched_default=self.config.rules.unmatched_default,
+            ),
+        )
 
         self._cycles = 0
         self._operations = 0
@@ -425,6 +453,7 @@ class Platform:
     def doors_open(self, train_id: str, station_id: str) -> dict:
         """开门并确认车门：对位必须先落盘。"""
 
+        self._gate("door.open", train_id=train_id, station_id=station_id)
         report = open_doors(self.doors, train_id, self.clock.now())
         group = self._primary_group(station_id)
         if group:
@@ -466,6 +495,7 @@ class Platform:
                 {"component": "interlock", "action": "lock", "detail": {"psd_id": gate.id}}
             )
         try:
+            self._gate("train.depart", train_id=train_id, station_id=station_id)
             closed = close_and_audit(
                 self.doors, self.audit, train_id, station_id, DEPART, self.clock.now()
             )
@@ -575,6 +605,10 @@ class Platform:
         """清除门区故障并按条件解锁。"""
 
         gate = self.gates.require(psd_id)
+        try:
+            self._gate("interlock.clear", psd_id=psd_id, station_id=gate.station)
+        except RailError as error:
+            return {"ok": False, "psd_id": psd_id, "locked": True, "violations": [error.message]}
         allowed, reason = releasable(self.gates, psd_id, True)
         if not allowed:
             return {"ok": False, "psd_id": psd_id, "locked": True, "violations": [reason]}
@@ -586,6 +620,10 @@ class Platform:
         """置位门区故障并锁定。"""
 
         gate = self.gates.require(psd_id)
+        try:
+            self._gate("interlock.set", psd_id=psd_id, station_id=gate.station)
+        except RailError as error:
+            return {"ok": False, "psd_id": psd_id, "locked": False, "violations": [error.message]}
         self.faults.set_fault(self.lockouts, psd_id, self.clock.now())
         self.audit.record("interlock_fault", "", gate.station, psd_id=psd_id)
         return {"ok": True, "psd_id": psd_id, "locked": True, "violations": []}
@@ -627,6 +665,10 @@ class Platform:
 
         layout = self.layouts.get(station_id)
         zones = list(layout.zones) if layout else []
+        try:
+            self._gate("door.batch_open", station_id=station_id)
+        except RailError as error:
+            return {"ok": False, "station_id": station_id, "violations": [error.message]}
         outcome = batch_open(self.doors, station_id, zones)
         nearest = nearest_zone(zones)
         self.audit.record(
@@ -666,6 +708,91 @@ class Platform:
         )
         return {"ok": True, "route": route.__dict__, "violations": []}
 
+    # ---- 联锁规则 -------------------------------------------------------
+
+    def save_rule_draft(self, content: dict, actor: str = "console", draft_id: str | None = None) -> dict:
+        """保存规则草稿并校验；校验不通过可以存，但永远发布不出去。"""
+
+        return self.rules.save_draft(content, actor, draft_id=draft_id)
+
+    def validate_rule_draft(self, draft_id: str, actor: str = "console") -> dict:
+        """按当前事实目录重新校验一份草稿（目录可能已变）。"""
+
+        return self.rules.validate_draft(draft_id, actor)
+
+    def publish_rules(
+        self,
+        draft_id: str,
+        expected_base: int,
+        gate: str = "deferred",
+        reason: str = "",
+        actor: str = "console",
+        op_id: str | None = None,
+    ) -> dict:
+        """发布草稿成为新版本；默认延迟生效，立即生效需站点策略放行并给理由。"""
+
+        result = self.rules.publish(
+            draft_id,
+            int(expected_base),
+            GatePolicy(mode=gate, reason=reason),
+            actor,
+            op_id=op_id,
+            quiescence=self._quiescence(),
+        )
+        return {"ok": True, **result}
+
+    def force_activate_rules(self, reason: str, actor: str = "console") -> dict:
+        """紧急越控：不等现场空闲，立即让待生效版本生效。"""
+
+        return {"ok": True, **self.rules.force_activate(actor, reason, self._quiescence())}
+
+    def cancel_rules_activation(self, reason: str, actor: str = "console") -> dict:
+        """取消待生效的规则版本。"""
+
+        return {"ok": True, **self.rules.cancel_pending(actor, reason)}
+
+    def rollback_rules(self, to_version: int, reason: str, actor: str = "console") -> dict:
+        """回退到历史版本内容：生成新版本向前约束，产出对账清单，不重算历史。"""
+
+        return {
+            "ok": True,
+            **self.rules.rollback(
+                int(to_version),
+                GatePolicy(mode="deferred"),
+                actor,
+                reason,
+                quiescence=self._quiescence(),
+            ),
+        }
+
+    def preview_rules(self, content: dict, command: str, params: dict | None = None, actor: str = "console") -> dict:
+        """用当前现场事实试算一份未发布内容（非权威）。"""
+
+        decision = self.rules.preview(
+            content,
+            command,
+            params or {},
+            self._fact_snapshot(params=(params or {})),
+            actor,
+        )
+        return {"ok": True, "decision": decision.as_dict()}
+
+    def replay_rule_decision(self, audit_id: str) -> dict:
+        """用审计钉住的版本与快照重算一次判定，核对结论一致。"""
+
+        return {"ok": True, **self.rules.verify_replay(audit_id)}
+
+    def replay_rules_as_of(self, at: float, command: str, params: dict | None = None) -> dict:
+        """按某一时刻生效的版本重算一次门控判定（回放按当时版本算）。"""
+
+        decision = self.rules.decide_as_of(float(at), command, params or {}, self._fact_snapshot(params=params or {}))
+        return {"ok": True, "decision": decision.as_dict()}
+
+    def rules_status(self) -> dict:
+        """规则子系统状态：版本、草稿、待生效与现场空闲观测。"""
+
+        return {**self.rules.status(), "quiescence": self._quiescence().as_dict()}
+
     # ---- 控制循环 -----------------------------------------------------
 
     def cycle(self, dt: float = 1.0) -> dict:
@@ -687,6 +814,7 @@ class Platform:
         self.trend.append("locked_count", moment, interlock["locked_count"])
         self.trend.append("queued_commands", moment, queued_total(self.doors))
         self.trend.append("audit_entries", moment, len(self.audit.list()))
+        activated = self.rules.tick(self._quiescence())
         self._persist()
         return {
             "ok": True,
@@ -696,6 +824,7 @@ class Platform:
             "locked_count": interlock["locked_count"],
             "can_release_depart": interlock["can_release_depart"],
             "ready_trains": holding,
+            "rules_activated": activated,
             "gaps": gap_summary(self.gaps, [train.id for train in self.trains.list()]),
             "violations": [],
         }
@@ -741,6 +870,7 @@ class Platform:
             "interlock": interlock_status(
                 self.faults, self.gates, self.config.interlock.max_locked_ratio
             ),
+            "rules": self.rules.status(),
             "gaps": gap_summary(self.gaps, ids),
             "quota": {
                 ARRIVAL: self.quotas.status(ARRIVAL),
@@ -842,6 +972,61 @@ class Platform:
         return self.store.remove("platform/state")
 
     # ---- 内部 ---------------------------------------------------------
+
+    def _gate(self, command: str, **params: str) -> None:
+        """门控挂钩：有生效规则集时按规则判定，没有时保持既有硬编码行为。
+
+        判定被拒绝时抛 :class:`InterlockError`，走既有联锁拒绝的审计与返回路径。
+        规则集生效但未覆盖该命令时按站点策略处理：``deny`` 故障导向安全直接拒，
+        ``legacy`` 回落到硬编码条件（迁移期用）。
+        """
+
+        if not self.config.rules.enabled or self.rules.active_version() == 0:
+            return
+        decision = self.rules.decide(command, params, self._fact_snapshot(params=params))
+        if decision.allowed:
+            return
+        if decision.matched == 0 and self.config.rules.unmatched_default == "legacy":
+            return
+        raise InterlockError(
+            f"规则集 v{decision.version} 拒绝 {command}: {decision.reason}",
+            component="rules",
+        )
+
+    def _fact_snapshot(self, params: dict | None = None) -> dict:
+        """采集门控判定用的现场事实快照（与出厂事实目录一一对应）。"""
+
+        params = params or {}
+        train_id = str(params.get("train_id", ""))
+        psd_id = str(params.get("psd_id", ""))
+        gates = self.gates.list()
+        locked = self.lockouts.locked_count()
+        return {
+            "gap.clear": self.gaps.clear(train_id) if train_id else False,
+            "train.doors_open": self.train_doors.is_open(train_id) if train_id else False,
+            "train.aligned": self.align.durable(train_id) if train_id else False,
+            "psd.open_count": self.gates.count_open(),
+            "psd.locked_count": locked,
+            "psd.locked_ratio": round(locked / len(gates), 4) if gates else 0.0,
+            "interlock.fault_count": len(self.faults.active_ids()),
+            "interlock.armed": self.armers.armed(train_id) if train_id else False,
+            "quota.arrival_remaining": self.quotas.remaining(ARRIVAL),
+            "quota.depart_remaining": self.quotas.remaining(DEPART),
+            "station.gate_locked": self.lockouts.is_locked(psd_id) if psd_id else False,
+            "sig.aspect": aspect_of(self.signals, train_id) if train_id else "red",
+        }
+
+    def _quiescence(self) -> Quiescence:
+        """观测现场是否空闲：所有列车都完成了本站作业（门已开且已发车、无排队
+        指令）才算作业结束，延迟生效的规则版本只在这个窗口切换。"""
+
+        busy = sorted(
+            train.id
+            for train in self.trains.list()
+            if self.commands.pending(train.id)
+            or (opened(self.doors, train.id) and not departed(self.doors, train.id))
+        )
+        return Quiescence(quiescent=not busy, busy=tuple(busy))
 
     def _stop_position(self, station_id: str) -> int:
         """返回站台的停稳位置（取最近门区里程）。"""

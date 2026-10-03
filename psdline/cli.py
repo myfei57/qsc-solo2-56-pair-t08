@@ -87,6 +87,12 @@ def _cmd_demo(args: argparse.Namespace) -> int:
     cycles = [platform.cycle(dt=args.dt) for _ in range(args.cycles)]
     final_sweep = platform.sweep(args.station)
 
+    # 规则全生命周期：草稿 → 校验 → 发布（延迟生效）→ 控制循环确认作业结束后生效。
+    rules_draft = platform.save_rule_draft(_demo_ruleset())
+    rules_published = platform.publish_rules(rules_draft["draft_id"], rules_draft["base_version"])
+    rules_cycles = [platform.cycle(dt=args.dt) for _ in range(2)]
+    rules = platform.rules_status()
+
     # 演示自检用临时端口，避免和本机常驻服务抢 8080。
     server = ConsoleServer(platform, port=0)
     base_url = server.start()
@@ -113,6 +119,12 @@ def _cmd_demo(args: argparse.Namespace) -> int:
         "cycles_run": len(cycles),
         "last_cycle": cycles[-1],
         "final_sweep": {key: final_sweep[key] for key in ("closed", "scanned")},
+        "rules": {
+            "draft_valid": rules_draft["report"]["valid"],
+            "published": rules_published,
+            "activated": [cycle["rules_activated"] for cycle in rules_cycles if cycle["rules_activated"]],
+            "active": (rules["active"] or {}).get("version", 0),
+        },
         "probe": probe,
         "status": platform.status(),
     }
@@ -133,6 +145,40 @@ def _cmd_demo(args: argparse.Namespace) -> int:
         print(f"检查未通过: {failures}", file=sys.stderr)
         return 1
     return 0
+
+
+def _demo_ruleset() -> dict:
+    """演示用规则集：间隙确认且对位落盘才允许发车，故障门区过多时全站拒动。"""
+
+    return {
+        "schema_version": 1,
+        "rules": [
+            {
+                "id": "DEMO-PERMIT-DEPART",
+                "on": {"command": "train.depart"},
+                "effect": "permit",
+                "guard": {
+                    "op": "and",
+                    "args": [
+                        {"fact": "gap.clear"},
+                        {"fact": "train.aligned"},
+                    ],
+                },
+                "message": "间隙确认且对位落盘才允许发车",
+            },
+            {
+                "id": "DEMO-DENY-FAULT",
+                "on": {"command": "*"},
+                "effect": "deny",
+                "priority": 900,
+                "guard": {
+                    "op": "gt",
+                    "args": [{"fact": "interlock.fault_count"}, {"const": 2}],
+                },
+                "message": "故障门区超过 2 个时拒绝一切门控动作",
+            },
+        ],
+    }
 
 
 def _mirror_mapping(platform: Platform, station_id: str) -> dict[str, str]:

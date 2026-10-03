@@ -6,7 +6,11 @@
   },
   "namespace": {
     "line": "L1",
-    "stations": ["ST1", "ST2", "ST3"]
+    "stations": [
+      "ST1",
+      "ST2",
+      "ST3"
+    ]
   },
   "station": {
     "groups_per_station": 4,
@@ -50,5 +54,11 @@
   "console": {
     "host": "127.0.0.1",
     "port": 8080
+  },
+  "rules": {
+    "enabled": true,
+    "allow_immediate": false,
+    "allow_forced": true,
+    "unmatched_default": "deny"
   }
 }
