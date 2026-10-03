@@ -1,8 +1,8 @@
 """控制台页面。
 
-四个页面各自只读一份状态：站台页看门区与布局、列车页看到发与对位、门控页看开闭
-与锁定、告警页看故障与审计。页面不做任何写操作，动作一律走 ``/api/...`` 接口，
-避免浏览器刷新就把现场设备带动一次。
+五个页面各自只读一份状态：站台页看门区与布局、列车页看到发与对位、门控页看开闭
+与锁定、告警页看故障与审计、规则页看联锁规则版本与门控会话。页面不做任何写操作，
+动作一律走 ``/api/...`` 接口，避免浏览器刷新就把现场设备带动一次。
 """
 
 from __future__ import annotations
@@ -11,7 +11,7 @@ from html import escape
 
 from ..app import Platform
 
-PAGE_PATHS: tuple[str, ...] = ("/", "/trains", "/doors", "/alarms")
+PAGE_PATHS: tuple[str, ...] = ("/", "/trains", "/doors", "/alarms", "/rules")
 
 _STYLE = """
 body { font-family: ui-sans-serif, system-ui, sans-serif; margin: 0; background: #101820; color: #e8eef5; }
@@ -31,6 +31,7 @@ _NAV: tuple[tuple[str, str], ...] = (
     ("/trains", "列车"),
     ("/doors", "门控"),
     ("/alarms", "告警"),
+    ("/rules", "规则"),
 )
 
 
@@ -196,11 +197,59 @@ def _alarm_page(platform: Platform) -> str:
     return _shell("告警控制台", body)
 
 
+def _rules_page(platform: Platform) -> str:
+    """规则页：当前版本、历史、在途会话与审计链。"""
+
+    current = platform.rules_status()
+    version = current["version"] or {}
+    audit = current["audit"]
+    body = _table(
+        "当前生效规则",
+        [
+            ("版本", f"v{version.get('version', '-')}（{version.get('source', '-')}）"),
+            ("操作人", version.get("author", "-")),
+            ("原因", version.get("reason", "-")),
+            ("内容哈希", str(version.get("content_hash", "-"))[:16] + "…"),
+            ("审计链", f"{'完好' if audit['ok'] else '断裂'}（{audit['entries']} 条）"),
+        ],
+    )
+    body += _table(
+        "版本历史",
+        [
+            (
+                f"v{item['version']}",
+                f"{item['source']} {item['author']} {item['reason']}"
+                + (f"（回退自 v{item['rollback_of']}）" if item.get("rollback_of") else ""),
+            )
+            for item in platform.rules_history()
+        ]
+        or [("暂无", "-")],
+    )
+    body += _table(
+        "在途作业会话（钉住版本）",
+        [
+            (item["op_id"], f"钉住 v{item['pinned_version']}")
+            for item in current["sessions"]
+        ]
+        or [("无在途作业", "-")],
+    )
+    catalog = platform.rules_catalog()
+    body += _table(
+        "事实目录",
+        [
+            (name, f"{spec['kind']} {spec['description']}")
+            for name, spec in sorted(catalog.items())
+        ],
+    )
+    return _shell("联锁规则控制台", body)
+
+
 _RENDERERS = {
     "/": _station_page,
     "/trains": _train_page,
     "/doors": _door_page,
     "/alarms": _alarm_page,
+    "/rules": _rules_page,
 }
 
 

@@ -18,6 +18,7 @@ from .door import (
     active_group,
     batch_open,
     close_and_audit,
+    close_durable,
     depart,
     depart_policy,
     door_report,
@@ -26,10 +27,11 @@ from .door import (
     open_pressure,
     open_doors,
     open_group,
+    opened,
     process_queue,
     queued_total,
 )
-from .errors import RailError
+from .errors import InterlockError, RailError
 from .eventbus import Event, EventBus
 from .gap import GapRegistry, gap_summary
 from .ids import IdFactory
@@ -38,7 +40,6 @@ from .interlock import (
     InterlockArmer,
     interlock_status,
     next_sequence,
-    releasable,
     restore_lockouts,
     verdict_of,
 )
@@ -46,7 +47,15 @@ from .ns import Namespace, NamespaceRegistry
 from .platform import MappingRegistry, adjacent, group_keys, physical_groups, resolve
 from .psd import LockoutRegistry, PSD, PSDRegistry, sweep_station
 from .quota import QuotaRegistry
-from .sig import SignalController, aspect_of, depart_checked, refresh_position, signal_summary
+from .rules import (
+    DEFAULT_RULEBOOK,
+    RuleAudit,
+    RuleEngine,
+    RuleService,
+    RuleStore,
+    build_catalog,
+)
+from .sig import SignalController, aspect_of, refresh_position, signal_summary
 from .station import (
     DoorZone,
     Layout,
@@ -133,6 +142,26 @@ class Platform:
             store, self.align, self.commands, self.gates, self.lockouts
         )
         self.doors.set_batch_limit(self.config.door.batch_limit)
+
+        # 联锁规则系统：判定条件可配置、带版本、可回退。首次装配播种默认规则簿
+        # （逐条镜像原硬编码条件），之后现场走"校验 → 生效"流程改规则。
+        self.rule_store = RuleStore(store)
+        self.rules = RuleService(
+            self.rule_store,
+            RuleAudit(
+                JsonlJournal(
+                    store.root, "rules-audit", segment_limit=self.config.audit.journal_segment
+                ),
+                self.clock,
+            ),
+            RuleEngine(self.clock, store=store),
+            build_catalog(self.config),
+            self.clock,
+        )
+        if self.rule_store.head() is None:
+            self.rules.seed(
+                DEFAULT_RULEBOOK, author="system", reason="默认规则簿：镜像原硬编码联锁条件"
+            )
 
         self._cycles = 0
         self._operations = 0
@@ -338,11 +367,12 @@ class Platform:
         for train in self.trains.list():
             self.signals.clear(train.id, ARRIVAL)
             self.signals.clear(train.id, DEPART)
+        closed_sessions = self.rules.engine.close_all()
         report = {"ok": True, "train_id": "", "closed": closed, "steps": steps, "violations": []}
         summary = self._record_operation(op_id, "stop", report)
         self._operations += 1
         self._persist()
-        return {**report, **summary}
+        return {**report, **summary, "sessions_closed": closed_sessions}
 
     # ---- 到发编排 -----------------------------------------------------
 
@@ -408,6 +438,7 @@ class Platform:
             self.doors_open(train_id, station_id)
         except RailError as error:
             return reject(error.message)
+        self._ensure_session(train_id)
         entry = self.audit.record(ARRIVAL, train_id, station_id, position_m=position_m)
         report = {
             "ok": True,
@@ -423,8 +454,16 @@ class Platform:
         return {**report, **summary, "arrival_audit": entry.id}
 
     def doors_open(self, train_id: str, station_id: str) -> dict:
-        """开门并确认车门：对位必须先落盘。"""
+        """开门并确认车门：先过规则门控（对位落盘），再执行开门。"""
 
+        verdict = self.rules.gate_current(
+            "door.open",
+            self._gate_facts(train_id, station_id),
+            actor="interlock",
+            context={"train_id": train_id, "station_id": station_id},
+        )
+        if not verdict.allowed:
+            raise InterlockError("；".join(verdict.violations), component="interlock")
         report = open_doors(self.doors, train_id, self.clock.now())
         group = self._primary_group(station_id)
         if group:
@@ -490,29 +529,39 @@ class Platform:
                 "detail": {"train_id": train_id, "state": gap_state},
             }
         )
-        verdict = depart_checked(self.signals, self.store, self.gaps, train_id, self.clock.now())
-        if not verdict["ok"]:
+        gate_verdict = self._gate_depart(train_id, station_id)
+        if not gate_verdict["ok"]:
             report = {
                 "ok": False,
                 "train_id": train_id,
                 "station_id": station_id,
                 "steps": steps,
-                "violations": list(verdict["violations"]),
+                "violations": list(gate_verdict["violations"]),
             }
             summary = self._record_operation(op_id, "depart", report)
             return {**report, **summary}
+        steps.append(
+            {
+                "component": "interlock",
+                "action": "gate_pass",
+                "detail": {"train_id": train_id, "rules_version": gate_verdict["version"]},
+            }
+        )
+        self.signals.raise_signal(train_id, DEPART, self.clock.now())
         steps.append(
             {"component": "sig", "action": "depart_signal", "detail": {"train_id": train_id}}
         )
         departure = depart(self.doors, train_id, self.clock.now())
         if gate is not None:
             self.lockouts.clear(gate.id)
+        self.rules.engine.close_session(f"train-{train_id}")
         report = {
             "ok": True,
             "train_id": train_id,
             "station_id": station_id,
             "close_durable": bool(closed["close_durable"]),
-            "aspect": verdict["aspect"],
+            "aspect": aspect_of(self.signals, train_id),
+            "rules_version": gate_verdict["version"],
             "cleared_commands": departure["cleared_commands"],
             "steps": steps,
             "violations": [],
@@ -572,12 +621,17 @@ class Platform:
         }
 
     def clear_fault(self, psd_id: str) -> dict:
-        """清除门区故障并按条件解锁。"""
+        """清除门区故障并按规则判定可否解锁。"""
 
         gate = self.gates.require(psd_id)
-        allowed, reason = releasable(self.gates, psd_id, True)
-        if not allowed:
-            return {"ok": False, "psd_id": psd_id, "locked": True, "violations": [reason]}
+        verdict = self.rules.gate_current(
+            "interlock.release",
+            {"gate.open": gate.open, "gap.clear": True},
+            actor="interlock",
+            context={"psd_id": psd_id},
+        )
+        if not verdict.allowed:
+            return {"ok": False, "psd_id": psd_id, "locked": True, "violations": verdict.violations}
         self.faults.clear_fault(self.lockouts, psd_id, self.clock.now())
         self.audit.record("interlock_clear", "", gate.station, psd_id=psd_id)
         return {"ok": True, "psd_id": psd_id, "locked": False, "violations": []}
@@ -741,6 +795,7 @@ class Platform:
             "interlock": interlock_status(
                 self.faults, self.gates, self.config.interlock.max_locked_ratio
             ),
+            "rules": self.rules.current(),
             "gaps": gap_summary(self.gaps, ids),
             "quota": {
                 ARRIVAL: self.quotas.status(ARRIVAL),
@@ -841,7 +896,136 @@ class Platform:
             return False
         return self.store.remove("platform/state")
 
+    # ---- 联锁规则 -------------------------------------------------------
+
+    def rules_status(self) -> dict:
+        """返回规则系统状态：当前版本、在途会话、审计链校验。"""
+
+        return self.rules.current()
+
+    def rules_history(self) -> list[dict]:
+        """返回规则版本历史（只追加，含回退版本）。"""
+
+        return self.rules.history()
+
+    def rules_catalog(self) -> dict:
+        """返回事实目录：规则可引用的现场量与取值限值。"""
+
+        return self.rules.catalog.as_dict()
+
+    def rules_validate(self, content: dict) -> dict:
+        """校验一份规则簿，不生效。"""
+
+        return self.rules.validate(content)
+
+    def rules_simulate(self, scope: str, facts: dict) -> dict:
+        """用当前生效版本试算一次判定（只读）。"""
+
+        return self.rules.simulate(scope, facts)
+
+    def rules_activate(self, content: dict, base_version: int, author: str, reason: str) -> dict:
+        """校验通过后让规则簿生效为新版本，并落平台审计。"""
+
+        result = self.rules.activate(content, base_version, author, reason)
+        self.audit.record(
+            "rules_activate", "", "", version=result["version"], author=author, reason=reason
+        )
+        return result
+
+    def rules_rollback(self, target_version: int, base_version: int, author: str, reason: str) -> dict:
+        """回退到历史版本（生成内容相同的新版本，历史不改写）。"""
+
+        result = self.rules.rollback(target_version, base_version, author, reason)
+        self.audit.record(
+            "rules_rollback",
+            "",
+            "",
+            version=result["version"],
+            target_version=target_version,
+            author=author,
+            reason=reason,
+        )
+        return result
+
+    def rules_impact(self, version: int) -> dict:
+        """查询某一版规则生效期间的全部门控判定（影响面）。"""
+
+        return self.rules.impact(version)
+
+    def rules_replay(self, decision_id: str) -> dict:
+        """按当时版本与事实快照重放一条历史判定。"""
+
+        return self.rules.replay(decision_id)
+
+    def rules_evaluate_at(self, scope: str, facts: dict, at: float) -> dict:
+        """按指定时刻生效的版本判定（历史口径回放）。"""
+
+        return self.rules.evaluate_at(scope, facts, at)
+
+    def rules_audit(self) -> dict:
+        """返回规则审计链与校验结果。"""
+
+        return {"verify": self.rules.audit.verify(), "entries": self.rules.audit.list()}
+
     # ---- 内部 ---------------------------------------------------------
+
+    def _ensure_session(self, train_id: str):
+        """返回列车作业的门控会话，没有则开工钉住当前版本。"""
+
+        op_id = f"train-{train_id}"
+        session = self.rules.engine.session(op_id)
+        if session is None:
+            session = self.rules.engine.begin_session(op_id)
+        return session
+
+    def _gate_facts(self, train_id: str, station_id: str) -> dict:
+        """采集门控判定用的现场事实快照。"""
+
+        gate = self._primary_gate(station_id)
+        alignment = self.align.get(train_id)
+        dwell = self.dwells.get(train_id)
+        position = self.positions.get(train_id)
+        return {
+            "gap.clear": self.gaps.clear(train_id),
+            "door.close_durable": close_durable(self.doors, train_id),
+            "door.opened": opened(self.doors, train_id),
+            "door.queue_empty": not process_queue(self.doors, train_id),
+            "gate.open": bool(gate.open) if gate is not None else False,
+            "gate.locked": bool(gate.locked) if gate is not None else False,
+            "align.durable": bool(alignment and alignment.durable),
+            "align.error_m": abs(alignment.position_m - self._stop_position(station_id))
+            if alignment
+            else 0.0,
+            "interlock.locked_ratio": self.lockouts.locked_ratio(),
+            "train.position_m": float(position) if position is not None else 0.0,
+            "train.dwell_s": float(dwell.seconds) if dwell else 0.0,
+            "signal.aspect": aspect_of(self.signals, train_id),
+        }
+
+    def _gate_depart(self, train_id: str, station_id: str) -> dict:
+        """按作业钉住的规则版本判定发车联锁，判定落审计链。"""
+
+        session = self._ensure_session(train_id)
+        verdict = self.rules.gate(
+            session,
+            "depart",
+            self._gate_facts(train_id, station_id),
+            actor="interlock",
+            context={"train_id": train_id, "station_id": station_id},
+        )
+        self.audit.record(
+            "rule_gate",
+            train_id,
+            station_id,
+            scope="depart",
+            allowed=verdict.allowed,
+            version=verdict.version,
+        )
+        return {
+            "ok": verdict.allowed,
+            "violations": verdict.violations,
+            "version": verdict.version,
+        }
 
     def _stop_position(self, station_id: str) -> int:
         """返回站台的停稳位置（取最近门区里程）。"""

@@ -65,6 +65,16 @@ class Api:
         add("GET", "/api/doors", lambda params, body: {"doors": self._platform.status()["doors"]})
         add("GET", "/api/doors/{psdID}", self._gate)
         add("GET", "/api/interlock", lambda params, body: self._platform.status()["interlock"])
+        add("GET", "/api/rules", lambda params, body: self._platform.rules_status())
+        add("GET", "/api/rules/history", lambda params, body: {"versions": self._platform.rules_history()})
+        add("GET", "/api/rules/catalog", lambda params, body: self._platform.rules_catalog())
+        add("GET", "/api/rules/audit", lambda params, body: self._platform.rules_audit())
+        add("GET", "/api/rules/impact", self._rules_impact)
+        add("POST", "/api/rules/validate", self._rules_validate)
+        add("POST", "/api/rules/simulate", self._rules_simulate)
+        add("POST", "/api/rules/activate", self._rules_activate)
+        add("POST", "/api/rules/rollback", self._rules_rollback)
+        add("POST", "/api/rules/replay", self._rules_replay)
         add("GET", "/api/gaps", lambda params, body: self._platform.status()["gaps"])
         add("GET", "/api/quota", lambda params, body: self._platform.status()["quota"])
         add("GET", "/api/audit", self._audit)
@@ -184,6 +194,50 @@ class Api:
             "audit_log": self._platform.audit.journal.count() >= 0,
         }
         return {"ready": all(checks.values()), "checks": checks}
+
+    # ---- 联锁规则 -------------------------------------------------------
+
+    def _rules_validate(self, params: dict, body: dict) -> dict:
+        content = body.get("content", body)
+        return self._platform.rules_validate(content)
+
+    def _rules_simulate(self, params: dict, body: dict) -> dict:
+        facts = body.get("facts")
+        if not isinstance(facts, dict):
+            raise RailError("facts 必须是对象", component="console")
+        return self._platform.rules_simulate(_require(body, "scope"), facts)
+
+    def _rules_activate(self, params: dict, body: dict) -> dict:
+        content = body.get("content")
+        if not isinstance(content, dict):
+            raise RailError("缺少规则簿 content", component="console")
+        return self._platform.rules_activate(
+            content,
+            _as_int(body, "base_version", -1),
+            str(body.get("author", "")),
+            str(body.get("reason", "")),
+        )
+
+    def _rules_rollback(self, params: dict, body: dict) -> dict:
+        return self._platform.rules_rollback(
+            _as_int(body, "target_version", 0),
+            _as_int(body, "base_version", -1),
+            str(body.get("author", "")),
+            str(body.get("reason", "")),
+        )
+
+    def _rules_impact(self, params: dict, body: dict) -> dict:
+        return self._platform.rules_impact(int(params.get("version", 0)))
+
+    def _rules_replay(self, params: dict, body: dict) -> dict:
+        if body.get("decision_id"):
+            return self._platform.rules_replay(str(body["decision_id"]))
+        facts = body.get("facts")
+        if not isinstance(facts, dict):
+            raise RailError("facts 必须是对象", component="console")
+        return self._platform.rules_evaluate_at(
+            _require(body, "scope"), facts, _as_float(body, "at", 0.0)
+        )
 
     # ---- 动作 ---------------------------------------------------------
 

@@ -1,6 +1,6 @@
 """命令行入口。
 
-五个子命令覆盖日常使用：
+六个子命令覆盖日常使用：
 
 ``serve``   启动控制台 HTTP 服务，可选地在启动后探测接口；
 ``demo``    在本地跑一遍完整流程（到站开门 → 间隙探测 → 发车 → 批量开门 →
@@ -8,6 +8,8 @@
             前的真实运行检查；
 ``status``  打印当前状态快照；
 ``config``  打印生效配置；
+``rules``   联锁规则管理：show / history / catalog / audit / validate /
+            activate / rollback / impact / replay；
 ``reset``   清掉落盘的平台计数。
 """
 
@@ -182,6 +184,72 @@ def _cmd_reset(args: argparse.Namespace) -> int:
     return 0
 
 
+def _load_json_file(path: str) -> dict:
+    """读取一份 JSON 文件（规则簿等）。"""
+
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, json.JSONDecodeError) as error:
+        raise RailError(f"读取 JSON 文件失败 {path}: {error}", component="cli") from error
+    if not isinstance(payload, dict):
+        raise RailError(f"文件内容必须是 JSON 对象: {path}", component="cli")
+    return payload
+
+
+def _base_version(platform: Platform, args: argparse.Namespace) -> int:
+    """解析生效/回退用的基线版本，缺省取当前生效版本。"""
+
+    if args.base_version >= 0:
+        return args.base_version
+    current = platform.rules_status()["version"]
+    return 0 if current is None else int(current["version"])
+
+
+def _cmd_rules(args: argparse.Namespace) -> int:
+    platform = _build(args)
+    action = args.rules_action
+    if action == "show":
+        _dump(platform.rules_status())
+        return 0
+    if action == "history":
+        _dump({"versions": platform.rules_history()})
+        return 0
+    if action == "catalog":
+        _dump(platform.rules_catalog())
+        return 0
+    if action == "audit":
+        _dump(platform.rules_audit())
+        return 0
+    if action == "validate":
+        result = platform.rules_validate(_load_json_file(args.file))
+        _dump(result)
+        return 0 if result["ok"] else 1
+    if action == "activate":
+        result = platform.rules_activate(
+            _load_json_file(args.file),
+            _base_version(platform, args),
+            args.author,
+            args.reason,
+        )
+        _dump(result)
+        return 0
+    if action == "rollback":
+        _dump(
+            platform.rules_rollback(
+                args.target_version, _base_version(platform, args), args.author, args.reason
+            )
+        )
+        return 0
+    if action == "impact":
+        _dump(platform.rules_impact(args.version))
+        return 0
+    if action == "replay":
+        _dump(platform.rules_replay(args.decision_id))
+        return 0
+    raise RailError(f"未知规则动作: {action}", component="cli")
+
+
 def build_parser() -> argparse.ArgumentParser:
     """构造命令行解析器。"""
 
@@ -216,6 +284,37 @@ def build_parser() -> argparse.ArgumentParser:
 
     reset = sub.add_parser("reset", help="清掉落盘的平台计数", parents=[common])
     reset.set_defaults(func=_cmd_reset)
+
+    rules = sub.add_parser("rules", help="联锁规则：校验、生效、回退、回放", parents=[common])
+    rules_sub = rules.add_subparsers(dest="rules_action", required=True)
+    for name, help_text in (
+        ("show", "当前生效版本与门控会话"),
+        ("history", "版本历史"),
+        ("catalog", "事实目录"),
+        ("audit", "规则审计链"),
+    ):
+        rules_sub.add_parser(name, help=help_text, parents=[common]).set_defaults(func=_cmd_rules)
+    validate = rules_sub.add_parser("validate", help="校验规则簿，不生效", parents=[common])
+    validate.add_argument("file", help="规则簿 JSON 文件")
+    validate.set_defaults(func=_cmd_rules)
+    activate = rules_sub.add_parser("activate", help="校验通过后生效为新版本", parents=[common])
+    activate.add_argument("file", help="规则簿 JSON 文件")
+    activate.add_argument("--base-version", type=int, default=-1, help="基线版本（缺省取当前）")
+    activate.add_argument("--author", default="operator", help="操作人")
+    activate.add_argument("--reason", default="", help="变更原因")
+    activate.set_defaults(func=_cmd_rules)
+    rollback = rules_sub.add_parser("rollback", help="回退到历史版本", parents=[common])
+    rollback.add_argument("target_version", type=int, help="目标版本号")
+    rollback.add_argument("--base-version", type=int, default=-1, help="基线版本（缺省取当前）")
+    rollback.add_argument("--author", default="operator", help="操作人")
+    rollback.add_argument("--reason", default="", help="回退原因")
+    rollback.set_defaults(func=_cmd_rules)
+    impact = rules_sub.add_parser("impact", help="查询某版本期间的判定影响面", parents=[common])
+    impact.add_argument("version", type=int, help="版本号")
+    impact.set_defaults(func=_cmd_rules)
+    replay = rules_sub.add_parser("replay", help="按当时版本重放一条判定", parents=[common])
+    replay.add_argument("decision_id", help="判定标识（gd-xxxxxxxx）")
+    replay.set_defaults(func=_cmd_rules)
     return parser
 
 
